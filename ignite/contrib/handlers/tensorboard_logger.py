@@ -31,6 +31,38 @@ class OutputHandler(BaseOutputHandler):
                                                        another_engine=trainer),
                              event_name=Events.EPOCH_COMPLETED)
 
+        Example with CustomPeriodicEvent, where model is evaluated every 500 iterations:
+
+        .. code-block:: python
+
+            from ignite.contrib.handlers import CustomPeriodicEvent
+
+            cpe = CustomPeriodicEvent(n_iterations=500)
+            cpe.attach(trainer)
+
+            @trainer.on(cpe.Events.ITERATIONS_500_COMPLETED)
+            def evaluate(engine):
+                evaluator.run(validation_set, max_epochs=1)
+
+            from ignite.contrib.handlers.tensorboard_logger import *
+
+            tb_logger = TensorboardLogger(log_dir="experiments/tb_logs")
+
+            def global_step_transform(*args, **kwargs):
+                return trainer.state.iteration
+
+            # Attach the logger to the evaluator on the validation dataset and log NLL, Accuracy metrics after
+            # every 500 iterations. Since evaluator engine does not have CustomPeriodicEvent attached to it, we
+            # provide a global_step_transform to return the trainer.state.iteration for the global_step, each time
+            # evaluator metrics are plotted on Tensorboard.
+
+
+            tb_logger.attach(evaluator,
+                             log_handler=OutputHandler(tag="validation",
+                                                       metrics=["nll", "accuracy"],
+                                                       global_step_transform=global_step_transform),
+                             event_name=Events.EPOCH_COMPLETED)
+
     Args:
         tag (str): common title for all produced plots. For example, 'training'
         metric_names (list of str, optional): list of metric names to plot.
@@ -41,9 +73,12 @@ class OutputHandler(BaseOutputHandler):
         another_engine (Engine): another engine to use to provide the value of event. Typically, user can provide
             the trainer if this handler is attached to an evaluator and thus it logs proper trainer's
             epoch/iteration value.
-    """
-    def __init__(self, tag, metric_names=None, output_transform=None, another_engine=None):
-        super(OutputHandler, self).__init__(tag, metric_names, output_transform, another_engine)
+        global_step_transform (callable, optional): global step transform function to output a desired global step.
+            Output of function should be an integer. Default is None, global_step based on attached engine. If provided,
+            uses function output as global_step.
+        """
+    def __init__(self, tag, metric_names=None, output_transform=None, another_engine=None, global_step_transform=None):
+        super(OutputHandler, self).__init__(tag, metric_names, output_transform, another_engine, global_step_transform)
 
     def __call__(self, engine, logger, event_name):
 
@@ -52,8 +87,12 @@ class OutputHandler(BaseOutputHandler):
 
         metrics = self._setup_output_metrics(engine)
 
-        state = engine.state if self.another_engine is None else self.another_engine.state
-        global_step = state.get_event_attrib_value(event_name)
+        engine = engine if self.another_engine is None else self.another_engine
+        global_step = self.global_step_transform(engine, event_name)
+
+        if not isinstance(global_step, int):
+            raise TypeError("global_step must be int, got {}."
+                            " Please check the output of global_step_transform.".format(type(global_step)))
 
         for key, value in metrics.items():
             if isinstance(value, numbers.Number) or \
@@ -140,6 +179,9 @@ class WeightsScalarHandler(BaseWeightsScalarHandler):
 
         global_step = engine.state.get_event_attrib_value(event_name)
         for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+
             name = name.replace('.', '/')
             logger.writer.add_scalar("weights_{}/{}".format(self.reduction.__name__, name),
                                      self.reduction(p.data),
@@ -177,6 +219,9 @@ class WeightsHistHandler(BaseWeightsHistHandler):
 
         global_step = engine.state.get_event_attrib_value(event_name)
         for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+
             name = name.replace('.', '/')
             logger.writer.add_histogram(tag="weights/{}".format(name),
                                         values=p.data.detach().cpu().numpy(),
@@ -216,6 +261,9 @@ class GradsScalarHandler(BaseWeightsScalarHandler):
 
         global_step = engine.state.get_event_attrib_value(event_name)
         for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+
             name = name.replace('.', '/')
             logger.writer.add_scalar("grads_{}/{}".format(self.reduction.__name__, name),
                                      self.reduction(p.grad),
@@ -252,6 +300,9 @@ class GradsHistHandler(BaseWeightsHistHandler):
 
         global_step = engine.state.get_event_attrib_value(event_name)
         for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+
             name = name.replace('.', '/')
             logger.writer.add_histogram(tag="grads/{}".format(name),
                                         values=p.grad.detach().cpu().numpy(),
@@ -354,7 +405,7 @@ class TensorboardLogger(BaseLogger):
             raise RuntimeError("This contrib module requires tensorboardX to be installed. "
                                "Please install it with command: \n pip install tensorboardX")
 
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = SummaryWriter(logdir=log_dir)
 
     def close(self):
         self.writer.close()
